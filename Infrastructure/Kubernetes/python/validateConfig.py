@@ -1,474 +1,442 @@
 #!/usr/bin/env python3
 # validate_k8s_config.py
-# A simple internal validation tool for Kubernetes configurations using Kustomize and Kubeconform.
+#
+# A validation tool for Kubernetes configurations that combines the output format
+# of the original script with the modern enhancements of Rich tables and dependency management.
+# Fixed version with proper text truncation handling and URL description fetching.
 
+import argparse
+import platform
+import re
 import subprocess
 import sys
-import os
-import tempfile
-import yaml # For parsing kustomization.yaml
-import shutil # For checking if commands exist
-import platform # For more detailed OS info
-import re # For parsing kubeconform output
-import textwrap # For text wrapping
+import urllib.request
+import urllib.parse
+from collections import defaultdict
+from importlib import import_module
+from pathlib import Path
+from shutil import which
+from tempfile import TemporaryDirectory
+from typing import List, Tuple, Dict, Optional
 
-def run_command(command, error_message, capture_output=True):
-    """
-    Executes a shell command and checks for errors.
-    Returns (stdout, stderr, returncode) on success.
-    Exits the script on command not found or CalledProcessError.
-    """
+# --- Dependency Definitions ---
+REQUIRED_PYTHON_PACKAGES = {"rich": "rich", "yaml": "PyYAML"}
+REQUIRED_CLI_TOOLS = ["kustomize", "kubeconform"]
+
+# --- Configuration ---
+CRD_SCHEMA_LOCATIONS = [
+    "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json",
+    "https://raw.githubusercontent.com/cert-manager/cert-manager/v1.13.2/deploy/crds/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json",
+    "https://raw.githubusercontent.com/argoproj/argo-cd/v2.9.3/manifests/crds/{{.ResourceKind}}.json",
+    "https://raw.githubusercontent.com/fluxcd/source-controller/v1.2.3/config/crd/bases/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json",
+    "https://raw.githubusercontent.com/traefik/traefik/v2.11/docs/content/reference/api/kubernetes-crd-definition-v1.yml",
+]
+
+# Global console object
+console = None
+
+# ==============================================================================
+# URL Handling and Description Fetching
+# ==============================================================================
+def get_url_description(url: str, max_length: int = 80) -> str:
+    """Fetch and return a description for a URL, or return a shortened version if too long."""
+    if not url.startswith('http'):
+        return url
+    
+    # If URL is not too long, return as is
+    if len(url) <= max_length:
+        return url
+    
     try:
-        result = subprocess.run(
-            command,
-            capture_output=capture_output,
-            text=True,
-            check=True, # This will raise CalledProcessError on non-zero exit code
-            shell=True
-        )
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.CalledProcessError as e:
-        print(f"Error: {error_message}")
-        print(f"Command failed with exit code {e.returncode}: {e.cmd}")
-        print("\n--- Command Stdout ---")
-        print(e.stdout.strip() if e.stdout else "No stdout")
-        print("\n--- Command Stderr ---")
-        print(e.stderr.strip() if e.stderr else "No stderr")
-        sys.exit(1)
-    except FileNotFoundError:
-        print(f"Error: Command not found. Make sure '{command.split()[0]}' is installed and in your PATH.")
-        sys.exit(1)
-
-def install_tool(tool_name, os_info):
-    """
-    Attempts to install a missing tool based on OS.
-    Returns True on success, False on failure.
-    """
-    print(f"\nAttempting to install {tool_name}...")
-    try:
-        if os_info['platform'] == 'linux':
-            if os_info['distro'] == 'debian' or os_info['distro'] == 'ubuntu':
-                if tool_name == "kustomize":
-                    print("Using snap to install kustomize...")
-                    subprocess.run(["sudo", "snap", "install", "kustomize", "--classic"], check=True)
-                elif tool_name == "kubeconform":
-                    print("Downloading and installing kubeconform manually...")
-                    latest_kubeconform_version = "v0.6.1" # Manually set, consider automating fetching for production use
-                    download_url = f"https://github.com/yannh/kubeconform/releases/download/{latest_kubeconform_version}/kubeconform-linux-amd64.tar.gz"
-                    subprocess.run(["wget", download_url, "-O", "/tmp/kubeconform.tar.gz"], check=True)
-                    subprocess.run(["tar", "-xzf", "/tmp/kubeconform.tar.gz", "-C", "/tmp/"], check=True)
-                    subprocess.run(["sudo", "mv", "/tmp/kubeconform", "/usr/local/bin/"], check=True)
-                    os.remove("/tmp/kubeconform.tar.gz")
-            elif os_info['distro'] == 'fedora' or os_info['distro'] == 'centos' or os_info['distro'] == 'rhel':
-                if tool_name == "kustomize":
-                    print("Using dnf to install kustomize...")
-                    subprocess.run(["sudo", "dnf", "install", "-y", "kustomize"], check=True)
-                elif tool_name == "kubeconform":
-                    print("Downloading and installing kubeconform manually...")
-                    latest_kubeconform_version = "v0.6.1" # Manually set, consider automating fetching for production use
-                    download_url = f"https://github.com/yannh/kubeconform/releases/download/{latest_kubeconform_version}/kubeconform-linux-amd64.tar.gz"
-                    subprocess.run(["wget", download_url, "-O", "/tmp/kubeconform.tar.gz"], check=True)
-                    subprocess.run(["tar", "-xzf", "/tmp/kubeconform.tar.gz", "-C", "/tmp/"], check=True)
-                    subprocess.run(["sudo", "mv", "/tmp/kubeconform", "/usr/local/bin/"], check=True)
-                    os.remove("/tmp/kubeconform.tar.gz")
-            else:
-                print(f"Automated installation for {tool_name} on your Linux distribution is not supported.")
-                return False
-        elif os_info['platform'] == 'darwin':
-            if shutil.which("brew") is None:
-                print("Homebrew is not installed. Please install Homebrew first: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"")
-                return False
-            if tool_name == "kustomize":
-                subprocess.run(["brew", "install", "kustomize"], check=True)
-            elif tool_name == "kubeconform":
-                subprocess.run(["brew", "install", "kubeconform"], check=True)
-        elif os_info['platform'] == 'win32':
-            print("Automated installation on Windows is not implemented. Please install manually:")
-            if tool_name == "kustomize":
-                print("  - Chocolatey: choco install kustomize")
-                print("  - Scoop: scoop install kustomize")
-            elif tool_name == "kubeconform":
-                print("  - Download manually from https://github.com/yannh/kubeconform/releases and add to PATH.")
-            return False
-        else:
-            print(f"Automated installation for {tool_name} on your OS is not supported.")
-            return False
-
-        if shutil.which(tool_name) is not None:
-            print(f"{tool_name} installed successfully.")
-            return True
-        else:
-            print(f"Failed to verify {tool_name} installation.")
-            return False
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error during installation of {tool_name}:")
-        print(f"Command '{' '.join(e.cmd)}' failed with exit code {e.returncode}")
-        print(f"Stderr: {e.stderr.strip()}")
-        print(f"Stdout: {e.stdout.strip()}")
-        print("Please check the output and try installing manually if necessary.")
-        return False
-    except Exception as e:
-        print(f"An unexpected error occurred during installation of {tool_name}: {e}")
-        return False
-
-def get_os_info():
-    """Detects the operating system and distribution."""
-    info = {'platform': sys.platform, 'distro': None}
-    if sys.platform.startswith('linux'):
-        try:
-            release_info = platform.freedesktop_os_release()
-            info['distro'] = release_info.get('ID', '').lower()
-            if not info['distro']:
-                if os.path.exists('/etc/debian_version'):
-                    info['distro'] = 'debian'
-                elif os.path.exists('/etc/redhat-release'):
-                    info['distro'] = 'rhel'
-                elif os.path.exists('/etc/fedora-release'):
-                    info['distro'] = 'fedora'
-        except Exception:
-            if os.path.exists('/etc/debian_version'):
-                info['distro'] = 'debian'
-            elif os.path.exists('/etc/redhat-release'):
-                info['distro'] = 'rhel'
-            elif os.path.exists('/etc/fedora-release'):
-                info['distro'] = 'fedora'
-    return info
-
-def check_and_install_tools():
-    """
-    Checks if kustomize and kubeconform are installed. If not, provides installation instructions
-    and optionally installs them after user approval.
-    """
-    missing_tools = []
+        # Try to fetch the page title or description
+        with urllib.request.urlopen(url, timeout=5) as response:
+            if response.status == 200:
+                content = response.read().decode('utf-8', errors='ignore')
+                # Look for title tag
+                title_match = re.search(r'<title[^>]*>([^<]+)</title>', content, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    if title and len(title) < max_length:
+                        return f"{title} ({urllib.parse.urlparse(url).netloc})"
+                
+                # Look for description meta tag
+                desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\'>]+)["\'][^>]*>', content, re.IGNORECASE)
+                if desc_match:
+                    desc = desc_match.group(1).strip()
+                    if desc and len(desc) < max_length:
+                        return f"{desc} ({urllib.parse.urlparse(url).netloc})"
+    except Exception:
+        # If fetching fails, fall back to shortened URL
+        pass
     
-    if shutil.which("kustomize") is None:
-        missing_tools.append("kustomize")
+    # Fallback: return shortened URL with domain
+    parsed = urllib.parse.urlparse(url)
+    domain = parsed.netloc
+    path_parts = parsed.path.split('/')
     
-    if shutil.which("kubeconform") is None:
-        missing_tools.append("kubeconform")
-
-    if not missing_tools:
-        return
-
-    print("\n--- Missing Required Tools ---")
-    print("The following tools are required but not found in your system's PATH:")
-    for tool in missing_tools:
-        print(f"- {tool}")
-    
-    install_option = input("Do you want to attempt to install the missing tools? (y/n): ").lower()
-
-    if install_option == 'y':
-        os_info = get_os_info()
-        installed_successfully = True
-        for tool in missing_tools:
-            if not install_tool(tool, os_info):
-                installed_successfully = False
-                print(f"Could not install {tool}. Please install it manually.")
-        
-        if not installed_successfully:
-            print("\n--- Installation Failed ---")
-            print("Some tools could not be installed automatically. Please install them manually to proceed.")
-            print("Refer to the instructions printed above or the official documentation:")
-            print("- Kustomize: https://kustomize.io/docs/user/installation/")
-            print("- Kubeconform: https://github.com/yannh/kubeconform/releases")
-            sys.exit(1)
-        else:
-            print("\n--- All Missing Tools Installed (or verified) ---")
-            if shutil.which("kustomize") is None or shutil.which("kubeconform") is None:
-                print("Warning: Tools were installed but could not be verified in the current PATH.")
-                print("Please try running the script again or verify your PATH setup.")
+    if len(path_parts) > 2:
+        shortened = f"{domain}/.../{'/'.join(path_parts[-2:])}"
     else:
-        print("\n--- Installation Declined ---")
-        print("Required tools are missing and installation was declined. Exiting.")
-        sys.exit(1)
+        shortened = f"{domain}{parsed.path}"
+    
+    if len(shortened) > max_length:
+        shortened = shortened[:max_length-3] + "..."
+    
+    return shortened
 
-def print_included_files_summary(included_files_summary, heading="--- Included Files Summary ---"):
-    """Prints the formatted table of included files."""
-    if included_files_summary:
-        print(f"\n{heading}")
-        print(f"{'Filename':<50} | Folder")
-        print("-" * 70)
-        included_files_summary.sort(key=lambda x: (x[1], x[0]))
-        for f_name, folder in included_files_summary:
-            print(f"{f_name:<50} | {folder}")
-        print("-" * 70)
-    else:
-        print("\n--- No YAML files explicitly included via 'resources' or 'patches' in this Kustomization. ---")
-        print("--- Please ensure your kustomization.yaml correctly lists its components. ---")
-
-
-def validate_k8s_config(kustomize_path):
-    """
-    Main function to build Kustomize manifests and validate them with Kubeconform.
-    """
-    check_and_install_tools()
-
-    if not kustomize_path:
-        print("Usage: python validate_k8s_config.py <path-to-kustomization-directory>")
-        print("Example: python validate_k8s_config.py clusters/staging")
-        print("Example: python validate_k8s_config.py clusters/production")
-        sys.exit(1)
-
-    if not os.path.isdir(kustomize_path):
-        print(f"Error: Kustomization directory '{kustomize_path}' not found.")
-        sys.exit(1)
-
-    print(f"--- Validating Kustomization: {kustomize_path} ---")
-
-    kustomization_file_path = os.path.join(kustomize_path, "kustomization.yaml")
-    if not os.path.exists(kustomization_file_path):
-        print(f"Error: kustomization.yaml not found in '{kustomize_path}'.")
-        sys.exit(1)
-
-    included_files_summary = []
-
+def get_kubeconform_url_description(url: str) -> str:
+    """Specifically handle kubeconform URLs to extract meaningful descriptions."""
+    if not url.startswith('http'):
+        return url
+    
     try:
-        with open(kustomization_file_path, 'r') as f:
-            kustomization_data = yaml.safe_load(f)
-
-        source_keys = ['resources', 'bases']
-        for key in source_keys:
-            if key in kustomization_data and kustomization_data[key]:
-                for item_path in kustomization_data[key]:
-                    full_item_path = os.path.abspath(os.path.join(kustomize_path, item_path))
-                    if os.path.isdir(full_item_path):
-                        for fname in os.listdir(full_item_path):
-                            if fname.endswith(('.yaml', '.yml')):
-                                included_files_summary.append((os.path.join(item_path, fname), os.path.basename(item_path)))
-                    elif os.path.isfile(full_item_path) and item_path.endswith(('.yaml', '.yml')):
-                        included_files_summary.append((item_path, os.path.basename(kustomize_path) + " (resource)"))
-
-        if 'patches' in kustomization_data and kustomization_data['patches']:
-            for patch_entry in kustomization_data['patches']:
-                patch_file_rel_path = patch_entry.get('path')
-                if patch_file_rel_path:
-                    full_patch_path = os.path.abspath(os.path.join(kustomize_path, patch_file_rel_path))
-                    if os.path.isfile(full_patch_path):
-                        included_files_summary.append((patch_file_rel_path, os.path.basename(kustomize_path) + " (patch)"))
-                    else:
-                        print(f"Warning: Patch file '{full_patch_path}' specified in kustomization.yaml not found.")
-
-        for fname in os.listdir(kustomize_path):
-            if fname.endswith(('.yaml', '.yml')) and fname != "kustomization.yaml":
-                relative_path = os.path.relpath(os.path.join(kustomize_path, fname), os.getcwd())
-                if not any(item[0] == relative_path or item[0].endswith(fname) for item in included_files_summary):
-                    included_files_summary.append((fname, os.path.basename(kustomize_path) + " (direct)"))
-
-        print_included_files_summary(included_files_summary)
-
-    except yaml.YAMLError as e:
-        print(f"Error parsing kustomization.yaml in '{kustomize_path}': {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"An unexpected error occurred while parsing Kustomization files for display: {e}")
-        sys.exit(1)
-
-    temp_fd, output_file_path = tempfile.mkstemp(suffix=".yaml", prefix="kubeconform-output-")
-
-    try:
-        os.close(temp_fd)
-
-        print("\nBuilding Kustomize manifests...")
-        stdout_kustomize, _, _ = run_command(
-            f"kustomize build {kustomize_path}",
-            f"Kustomize build failed for '{kustomize_path}'.",
-            capture_output=True
-        )
-        with open(output_file_path, "w") as f:
-            f.write(stdout_kustomize)
-        print(f"Kustomize build successful. Output saved to {output_file_path}")
-
-        # Build resource-to-file mapping for better error reporting
-        print("\nBuilding resource-to-file mapping...")
-        resource_to_file_map = {}
+        # Create a request with proper headers to avoid blocking
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; Kubeconform-Validator/1.0)'
+        })
         
-        def scan_yaml_files_for_resources(directory_path, relative_base_path=""):
-            """Recursively scan YAML files and map resources to their file paths"""
-            if not os.path.isdir(directory_path):
-                return
+        with urllib.request.urlopen(req, timeout=8) as response:
+            if response.status == 200:
+                content = response.read().decode('utf-8', errors='ignore')
                 
-            for item in os.listdir(directory_path):
-                item_path = os.path.join(directory_path, item)
-                relative_item_path = os.path.join(relative_base_path, item) if relative_base_path else item
-                
-                if os.path.isdir(item_path):
-                    scan_yaml_files_for_resources(item_path, relative_item_path)
-                elif item.endswith(('.yaml', '.yml')) and item != 'kustomization.yaml':
-                    try:
-                        with open(item_path, 'r') as f:
-                            # Parse multiple YAML documents in a single file
-                            for doc in yaml.safe_load_all(f):
-                                if doc and isinstance(doc, dict):
-                                    kind = doc.get('kind', '')
-                                    metadata = doc.get('metadata', {})
-                                    name = metadata.get('name', '')
-                                    if kind and name:
-                                        resource_key = f"{kind}/{name}"
-                                        resource_to_file_map[resource_key] = f"./{os.path.join(relative_base_path, item)}"
-                    except Exception as e:
-                        # Skip files that can't be parsed
-                        pass
-        
-        # Scan the base directory structure
-        base_dir = os.path.dirname(kustomize_path)
-        if base_dir:
-            scan_yaml_files_for_resources(base_dir, os.path.basename(base_dir))
-        
-        # Also scan the current kustomization path
-        scan_yaml_files_for_resources(kustomize_path, os.path.relpath(kustomize_path, '.'))
-
-        print("\nValidating generated manifests with Kubeconform...")
-        kubeconform_cmd = (
-            f"kubeconform -strict -kubernetes-version 1.28.0 " # Specify your K8s version
-            f"-schema-location default "
-            f"-schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/' "
-            f"-schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/' "
-            f"-schema-location 'https://raw.githubusercontent.com/cert-manager/cert-manager/v1.12.0/deploy/crds/' " # Cert-Manager specific CRDs
-            f"-schema-location 'https://raw.githubusercontent.com/traefik/traefik/v2.10/docs/schemas/providers/kubernetes_crd/' " # Traefik specific CRDs
-            f"--skip Secret " # Added to skip Secret validation due to 'sops' field
-            f"{output_file_path}"
-        )
-
-        kubeconform_result = subprocess.run(
-            kubeconform_cmd,
-            capture_output=True,
-            text=True,
-            shell=True,
-            check=False
-        )
-
-        if kubeconform_result.returncode != 0:
-            print("\n--- Kubeconform Validation FAILED ---")
-            # Parse and format kubeconform output into table
-            print("\n--- Kubeconform Validation Errors ---")
-            stdout_lines = kubeconform_result.stdout.strip().splitlines() if kubeconform_result.stdout else []
-            stderr_lines = kubeconform_result.stderr.strip().splitlines() if kubeconform_result.stderr else []
-            all_error_lines = stdout_lines + stderr_lines
-            
-            if all_error_lines:
-                # Table headers with full width columns - no truncation
-                header_failed_resource = "Failed Resource"
-                header_file_location = "File Location" 
-                header_additional_info = "Additional Info"
-                
-                print(f"{header_failed_resource:<50} | {header_file_location:<70} | {header_additional_info}")
-                print("-" * (50 + 3 + 70 + 3 + 120))
-                
-                # Parse each error line and extract information
-                entry_count = 0
-                for line in all_error_lines:
-                    if line.strip() and not line.startswith("No stderr"):
-                        # Add separator line between entries (except before the first entry)
-                        if entry_count > 0:
-                            separator_line = "-" * (50 + 3 + 70 + 3 + 80)
-                            print(separator_line)
-                        entry_count += 1
-                        # Kubeconform output format: file_path - ResourceKind resource_name error_message
-                        # Example: /tmp/file.yaml - PersistentVolumeClaim pvc-name is invalid: error details
-                        
-                        # Split on first " - " to separate file path from the rest
-                        if " - " in line:
-                            temp_file_path, rest = line.split(" - ", 1)
-                            temp_file_path = temp_file_path.strip()
-                            
-                            # Extract resource kind and name, and error details
-                            # Look for pattern: ResourceKind resource_name <rest_of_message>
-                            resource_match = re.match(r"^(\S+)\s+(\S+)\s+(.+)$", rest.strip())
-                            if resource_match:
-                                resource_kind = resource_match.group(1)
-                                resource_name = resource_match.group(2)
-                                error_details = resource_match.group(3)
-                                failed_resource = f"{resource_kind}/{resource_name}"
-                                additional_info = error_details
-                                
-                                # Map to actual source file location
-                                file_location = resource_to_file_map.get(failed_resource, "Source file not found")
-                            else:
-                                # If pattern doesn't match, use the whole rest as resource info
-                                failed_resource = rest.strip()[:50] + "..." if len(rest.strip()) > 50 else rest.strip()
-                                additional_info = "See full error details"
-                                file_location = "Unknown source"
+                # For GitHub URLs, try to extract meaningful info
+                if 'github.com' in url:
+                    # Look for repository description
+                    repo_desc_match = re.search(r'<meta property="og:description" content="([^"]+)"', content)
+                    if repo_desc_match:
+                        desc = repo_desc_match.group(1).strip()
+                        if desc and desc != "GitHub":
+                            return f"📖 {desc}"
+                    
+                    # Extract repository and file info from URL
+                    url_parts = url.split('/') 
+                    if len(url_parts) >= 5:
+                        owner = url_parts[3]
+                        repo = url_parts[4]
+                        if 'crd' in url.lower() or 'schema' in url.lower():
+                            return f"🔧 CRD Schema from {owner}/{repo}"
                         else:
-                            # If no " - " separator found, treat whole line as error
-                            file_location = "Unknown"
-                            failed_resource = "Parse Error"
-                            additional_info = line.strip()
-                        
-                        # Show full information with text wrapping for long additional info
-                        failed_resource_display = failed_resource
-                        file_location_display = file_location
-                        
-                        # Wrap long additional info text to multiple lines (80 chars per line)
-                        wrapped_additional_info = textwrap.fill(additional_info, width=80).split('\n')
-                        
-                        # Print the first line with all columns
-                        first_additional_info = wrapped_additional_info[0] if wrapped_additional_info else ""
-                        print(f"{failed_resource_display:<50} | {file_location_display:<70} | {first_additional_info}")
-                        
-                        # Print continuation lines for additional info (if any)
-                        for continuation_line in wrapped_additional_info[1:]:
-                            print(f"{'':<50} | {'':<70} | {continuation_line}")
+                            return f"📁 Resource from {owner}/{repo}"
                 
-                print("-" * (35 + 3 + 45 + 3 + 100))
-            else:
-                print("No error details available.")
-            
-            print("\n--- Summary of Failing Resources (from Kubeconform) ---")
-            header_resource = 'Kind/Name (from Kubeconform)'
-            header_error_excerpt = 'Error Message (excerpt)'
-            header_potential_files = 'Potential Source Files (from list above)'
-            
-            print(f"{header_resource:<40} | {header_error_excerpt:<60} | {header_potential_files}")
-            print("-" * (40 + 3 + 60 + 3 + 70))
+                # For other documentation URLs
+                title_match = re.search(r'<title[^>]*>([^<]+)</title>', content, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    # Clean up common title suffixes
+                    title = re.sub(r's*[-|]s*(GitHub|Kubernetes|Documentation).*$', '', title)
+                    if title and len(title) <= 80:
+                        return f"📄 {title}"
+                
+                # Look for schema-specific descriptions
+                if 'schema' in url.lower() or '.json' in url:
+                    return "🔧 Kubernetes Resource Schema"
+                
+    except Exception as e:
+        # If specific handling fails, provide context-aware fallback
+        pass
+    
+    # Enhanced fallback based on URL patterns
+    if 'crd' in url.lower():
+        return "🔧 Custom Resource Definition Schema"
+    elif 'schema' in url.lower():
+        return "📋 Kubernetes Resource Schema"
+    elif 'github.com' in url:
+        # Extract owner/repo from GitHub URL
+        url_parts = url.split('/') 
+        if len(url_parts) >= 5:
+            owner = url_parts[3]
+            repo = url_parts[4]
+            return f"📁 {owner}/{repo} (GitHub Repository)"
+    elif 'kubernetes.io' in url:
+        return "📖 Kubernetes Official Documentation"
+    
+    # Final fallback with domain
+    parsed = urllib.parse.urlparse(url)
+    domain = parsed.netloc
+    return f"🔗 {domain}"
 
-            failing_resource_details = []
-            regex_kind_name = re.compile(r'^- (.+?)\s+-\s+([a-zA-Z0-9\-\.]+)/([a-zA-Z0-9\-\.]+)\s+-\s+(.+)$')
-            regex_kind_only = re.compile(r'^- (.+?)\s+-\s+\((.+?)\)\s+-\s+(.+)$')
+def format_kubeconform_message(msg: str) -> str:
+    """Format kubeconform error messages by replacing URLs with descriptions."""
+    if not msg:
+        return msg
+    
+    # Simple URL replacements
+    replacements = [
+        (r'https://raw\.githubusercontent\.com/yannh/kubernetes-json-schema/[^/]+/[^/]+/persistentvolumeclaim[^.\s]*\.json[^)\s]*', 
+         '(📋 PersistentVolumeClaim Schema)'),
+        (r'https://raw\.githubusercontent\.com/yannh/kubernetes-json-schema/[^/]+/[^/]+/[^.\s]*\.json[^)\s]*', 
+         '(📋 Kubernetes Resource Schema)'),
+        (r'https://raw\.githubusercontent\.com/[^/]+/[^/]+/[^/]+/[^/]+/crds/[^)\s]*', 
+         '(🔧 Custom Resource Schema)'),
+        (r'https://[^)\s]*github[^)\s]*schema[^)\s]*', 
+         '(📋 Resource Schema)'),
+    ]
+    
+    result = msg
+    for pattern, replacement in replacements:
+        result = re.sub(pattern, replacement, result)
+    
+    # Clean up common error patterns
+    if 'additionalProperties' in result and 'not allowed' in result:
+        prop_match = re.search(r"additionalProperties '([^']+)' not allowed", result)
+        if prop_match:
+            prop = prop_match.group(1)
+            result = f"Property '{prop}' is not allowed in this resource type"
+    
+    return result
 
-            error_lines = (kubeconform_result.stdout + kubeconform_result.stderr).splitlines()
-            for line in error_lines:
-                match_kind_name = regex_kind_name.match(line)
-                if match_kind_name:
-                    res_key = f"{match_kind_name.group(2)}/{match_kind_name.group(3)}"
-                    error_msg_excerpt = match_kind_name.group(4).strip()
-                    failing_resource_details.append((res_key, error_msg_excerpt)) # Removed included_files_summary here
-                else:
-                    match_kind_only = regex_kind_only.match(line)
-                    if match_kind_only:
-                        res_key = f"{match_kind_only.group(2)}/(unnamed)"
-                        error_msg_excerpt = match_kind_only.group(3).strip()
-                        failing_resource_details.append((res_key, error_msg_excerpt)) # Removed included_files_summary here
+def format_display_text(text: str, max_length: int = 80) -> str:
+    """Format text for display, handling long URLs appropriately."""
+    if not text:
+        return text
+    
+    # Check if text contains URLs
+    url_pattern = r'https?://[^\s]+'
+    urls = re.findall(url_pattern, text)
+    
+    formatted_text = text
+    for url in urls:
+        if len(url) > max_length:
+            description = get_url_description(url, max_length)
+            formatted_text = formatted_text.replace(url, description)
+    
+    return formatted_text
 
-            if failing_resource_details:
-                for res_key, error_msg_excerpt in sorted(failing_resource_details, key=lambda x: x[0]): # Iterate only on (res_key, error_msg_excerpt)
-                    all_source_files_str = ", ".join([f"{f[0]} ({f[1]})" for f in included_files_summary])
-                    displayed_sources = (all_source_files_str[:67] + '...') if len(all_source_files_str) > 67 else all_source_files_str
-                    displayed_error_excerpt = (error_msg_excerpt[:57] + '...') if len(error_msg_excerpt) > 57 else error_msg_excerpt
+# ==============================================================================
+# Dependency Checking and Installation Logic
+# ==============================================================================
+def check_and_install_dependencies():
+    global console
+    pre_check_print = print
+    if import_module_silently("rich"):
+        from rich.console import Console
+        console = Console(stderr=True)
+        pre_check_print = console.print
 
-                    print(f"{res_key:<40} | {displayed_error_excerpt:<60} | {displayed_sources}")
+    missing_py = [pkg for name, pkg in REQUIRED_PYTHON_PACKAGES.items() if not import_module_silently(name)]
+    missing_cli = [tool for tool in REQUIRED_CLI_TOOLS if not which(tool)]
+    if not missing_py and not missing_cli: return
 
-            else:
-                 print(f"{'No specific resources identified':<40} | {'See Raw Kubeconform Output above':<60} | {'All source files listed above are potential causes.':<70}")
+    pre_check_print("\n--- [bold yellow]Missing Dependencies Detected[/bold yellow] ---")
+    if missing_py: pre_check_print("Required Python packages: " + ", ".join(f"[cyan]{p}[/cyan]" for p in missing_py))
+    if missing_cli: pre_check_print("Required CLI tools: " + ", ".join(f"[cyan]{t}[/cyan]" for t in missing_cli))
 
-            print("-" * (40 + 3 + 60 + 3 + 70))
+    try: answer = input("\nDo you want to attempt to install them? (y/n): ").lower()
+    except (EOFError, KeyboardInterrupt): sys.exit(1)
+    if answer != 'y': sys.exit(1)
+    
+    pre_check_print("\n--- [bold]Attempting Installation[/bold] ---")
+    all_success = True
+    for pkg in missing_py:
+        if not _install_python_package(pkg, pre_check_print): all_success = False
+    for tool in missing_cli:
+        if not _install_cli_tool(tool, pre_check_print): all_success = False
+    if not all_success: sys.exit(1)
+    if missing_py:
+        pre_check_print("\n[bold green]Dependencies installed.[/bold green] Please run the script again.")
+        sys.exit(0)
 
-            print(f"\nDebugging Tip: The errors occurred in the consolidated YAML generated for '{kustomize_path}'.")
-            print(f"You can inspect this full generated manifest at: {output_file_path}")
-            print("To find the source of the error, look for the 'Kind/Name' reported by Kubeconform in the generated YAML, then check the relevant source files (from 'Included Files Summary' above) that define that resource. Look for typos in `kind`, `apiVersion`, incorrect field names, or invalid values according to Kubernetes schema.")
-            sys.exit(1)
+def import_module_silently(name):
+    try: import_module(name); return True
+    except ImportError: return False
+
+def _install_python_package(pkg, printer):
+    printer(f"  -> Installing Python package: [bold cyan]{pkg}[/bold cyan]...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=True, capture_output=True, text=True)
+        printer(f"  [green]✓ Successfully installed {pkg}.[/green]"); return True
+    except subprocess.CalledProcessError as e:
+        printer(f"  [bold red]✗ Error installing {pkg}:[/bold red]\n  Stderr: {e.stderr.strip()}"); return False
+
+def _install_cli_tool(tool, printer):
+    printer(f"  -> Installing CLI tool: [bold cyan]{tool}[/bold cyan]...")
+    if sys.platform == "darwin" and which("brew"): cmd = ["brew", "install", tool]
+    elif sys.platform.startswith("linux"):
+        sudo = ["sudo"] if which("sudo") else []
+        if Path("/etc/debian_version").exists(): cmd = sudo + ["apt-get", "install", "-y", tool]
+        elif Path("/etc/redhat-release").exists(): cmd = sudo + ["dnf", "install", "-y", tool]
+        else: return False
+    else: return False
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        printer(f"  [green]✓ Successfully installed {tool}.[/green]"); return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        printer(f"  [bold red]✗ Error installing {tool}: {e}[/bold red]"); return False
+
+# ==============================================================================
+# Kustomize Parsing and Resource Mapping Logic
+# ==============================================================================
+def build_resource_map(base_path: Path) -> Dict[str, str]:
+    import yaml
+    resource_map = {}
+    for yaml_file in base_path.rglob("*.yaml"):
+        if yaml_file.name == "kustomization.yaml": continue
+        try:
+            for doc in yaml.safe_load_all(yaml_file.read_text()):
+                if doc and isinstance(doc, dict):
+                    kind, name = doc.get("kind"), doc.get("metadata", {}).get("name")
+                    if kind and name:
+                        resource_map[f"{kind}/{name}"] = str(yaml_file)
+        except (yaml.YAMLError, IOError):
+            pass
+    return resource_map
+
+def print_included_files_summary(kustomize_path: Path):
+    from rich.table import Table
+    from rich import box
+    console.print(f"\n[bold]--- Included Files Summary ---[/bold]")
+    table = Table(box=box.MINIMAL, show_header=True, header_style="bold cyan")
+    table.add_column("Filename", style="green", no_wrap=False)
+    table.add_column("Folder", style="yellow", no_wrap=False)
+    
+    files_by_folder = defaultdict(list)
+    for f in kustomize_path.rglob("*.yaml"):
+        relative_path = f.relative_to(kustomize_path)
+        folder = relative_path.parts[0] if len(relative_path.parts) > 1 else "."
+        files_by_folder[folder].append(str(relative_path))
+
+    last_folder = None
+    for folder in sorted(files_by_folder.keys()):
+        if folder == ".": continue
+        if last_folder is not None:
+            table.add_section()
+        for file_path in sorted(files_by_folder[folder]):
+            table.add_row(file_path, folder)
+        last_folder = folder
+
+    console.print(table)
+
+# ==============================================================================
+# Main Application and Output Logic
+# ==============================================================================
+def run_command(command: List[str]) -> Tuple[str, str, int]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        return result.stdout, result.stderr, result.returncode
+    except FileNotFoundError:
+        console.print(f"Error: Command not found. Make sure '[bold]{command[0]}[/bold]' is installed.")
+        sys.exit(1)
+
+def build_kustomize(kustomize_path: Path) -> Optional[str]:
+    console.print("\n[bold]Building Kustomize manifests...[/bold]")
+    stdout, stderr, returncode = run_command(["kustomize", "build", str(kustomize_path)])
+    
+    if returncode != 0 or not stdout.strip():
+        console.print("\n[bold red]✗ Kustomize Build FAILED[/bold red]")
+        if not stdout.strip(): console.print("Error: 'kustomize build' produced no output.")
+        if stderr.strip(): console.print(f"[red]Stderr:\n{stderr}[/red]")
+        return None
+        
+    console.print("[green]✓ Kustomize build successful.[/green]")
+    return stdout
+
+def validate_with_kubeconform(content: str, k8s_ver: str, skip: List[str], file_path: Path) -> Tuple[str, str, int]:
+    console.print("\n[bold]Validating generated manifests with Kubeconform...[/bold]")
+    file_path.write_text(content)
+    cmd = ["kubeconform", "-strict", f"-kubernetes-version={k8s_ver}"] + [f"-skip={k}" for k in skip] + ["-schema-location=default"] + [f"-schema-location={loc}" for loc in CRD_SCHEMA_LOCATIONS] + [str(file_path)]
+    return run_command(cmd)
+
+def print_validation_errors(stdout: str, stderr: str, resource_map: Dict[str, str]):
+    from rich.table import Table
+    from rich import box
+    console.print("\n[bold red]✗ Kubeconform Validation FAILED[/bold red]")
+    console.print("\n[bold]--- Kubeconform Validation Errors ---[/bold]")
+    
+    table = Table(box=box.MINIMAL, show_header=True, header_style="bold magenta")
+    table.add_column("Failed Resource", style="cyan", no_wrap=False)
+    table.add_column("File Location", style="green", no_wrap=False)
+    table.add_column("Additional Info", style="yellow", no_wrap=False)
+
+    all_lines = (stdout.strip() + "\n" + stderr.strip()).strip().splitlines()
+    parsed_errors = []
+
+    for line in all_lines:
+        if " - " not in line: continue
+        parts = line.split(" - ", 1)
+        rest = parts[1]
+        kind, name, msg = ("Unknown", "Unknown", rest)
+        match = re.match(r"(\S+)\s+(\S+)\s+(.+)", rest)
+        if match:
+            kind, name, msg = match.groups()
+        
+        key = f"{kind}/{name}"
+        location = resource_map.get(key, "[dim]Generated by Kustomize?[/dim]")
+        # Format the message to handle long URLs
+        formatted_msg = format_kubeconform_message(msg.strip())
+        parsed_errors.append({"key": key, "location": location, "msg": formatted_msg})
+
+    for i, error in enumerate(parsed_errors):
+        table.add_row(error["key"], error["location"], error["msg"])
+        if i < len(parsed_errors) - 1:
+             table.add_section()
+
+    if parsed_errors:
+        console.print(table)
+    else:
+        console.print("\n[yellow]Could not parse specific errors. Raw output below:[/yellow]")
+        if stdout.strip(): console.print("\n--- [bold]Stdout[/bold] ---\n" + f"[dim]{stdout.strip()}[/dim]")
+        if stderr.strip(): console.print("\n--- [bold]Stderr[/bold] ---\n" + f"[red]{stderr.strip()}[/red]")
+        
+    return parsed_errors
+
+def print_summary_of_failing_resources(parsed_errors):
+    from rich.table import Table
+    from rich import box
+    console.print("\n[bold]--- Summary of Failing Resources (from Kubeconform) ---[/bold]")
+    table = Table(box=box.MINIMAL, show_header=True, header_style="bold cyan")
+    table.add_column("Kind/Name (from Kubeconform)", style="green", no_wrap=False)
+    table.add_column("Error Message (excerpt)", style="yellow", no_wrap=False)
+    table.add_column("Potential Source Files", style="green", no_wrap=False)
+
+    if not parsed_errors:
+        table.add_row("No specific resources identified", "See Raw Kubeconform Output above", "All source files listed above are potential causes.")
+    else:
+        for error in parsed_errors:
+            # Format error message and location for display
+            formatted_msg = format_display_text(error['msg'])
+            formatted_location = format_display_text(error['location'])
+            table.add_row(error['key'], formatted_msg, formatted_location)
+
+    console.print(table)
+
+def main():
+    check_and_install_dependencies()
+
+    parser = argparse.ArgumentParser(description="A validation tool for Kubernetes configurations.")
+    parser.add_argument("kustomize_path", type=Path, help="Path to the directory containing a kustomization.yaml file.")
+    parser.add_argument("--k8s-version", default="1.28.0", help="Target Kubernetes version.")
+    parser.add_argument("--skip", action="append", default=["Secret"], help="Resource Kinds to skip.")
+    args = parser.parse_args()
+
+    kustomize_path = args.kustomize_path.resolve()
+    if not kustomize_path.is_dir() or not (kustomize_path / "kustomization.yaml").exists():
+        console.print(f"Error: Path '[bold red]{kustomize_path}[/bold red]' is not a valid Kustomization directory.")
+        sys.exit(1)
+
+    console.print(f"--- Validating Kustomization: [bold cyan]{kustomize_path}[/bold cyan] ---")
+    print_included_files_summary(kustomize_path)
+
+    console.print("\n[bold]Building resource-to-file mapping...[/bold]")
+    resource_map = build_resource_map(kustomize_path)
+    console.print("[green]✓ Resource map created.[/green]")
+
+    kustomize_output = build_kustomize(kustomize_path)
+    if kustomize_output is None: sys.exit(1)
+
+    with TemporaryDirectory() as tmpdir_name:
+        manifest_file = Path(tmpdir_name) / "manifest.yaml"
+        stdout, stderr, returncode = validate_with_kubeconform(kustomize_output, args.k8s_version, args.skip, manifest_file)
+
+        if returncode == 0:
+            console.print("[green]✓ Kubeconform validation successful.[/green]")
+            console.print(f"\n[bold green]Validation completed successfully for {kustomize_path}[/bold green]")
+            sys.exit(0)
         else:
-            print(f"Kubeconform validation successful for '{kustomize_path}'.")
-
-    finally:
-        if os.path.exists(output_file_path):
-            os.remove(output_file_path)
-            print(f"Cleaned up temporary file: {output_file_path}")
-
-    print(f"\n--- Validation completed successfully for {kustomize_path} ---")
-    sys.exit(0)
+            parsed_errors = print_validation_errors(stdout, stderr, resource_map)
+            print_summary_of_failing_resources(parsed_errors)
+            console.print("\n[bold]Debugging Tip:[/bold]")
+            console.print(f"You can inspect the fully rendered manifest at: [dim]{manifest_file}[/dim]")
+            sys.exit(1)
 
 if __name__ == "__main__":
-    kustomize_dir = sys.argv[1] if len(sys.argv) > 1 else ""
-    validate_k8s_config(kustomize_dir)
-
+    main()
