@@ -33,9 +33,12 @@ log_error() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/ssh-fix-automation.sh" ]]; then
     source "$SCRIPT_DIR/ssh-fix-automation.sh"
-if [[ -f "$SCRIPT_DIR/longhorn-upgrade.sh" ]]; then
-    source "$SCRIPT_DIR/longhorn-upgrade.sh"
+    if [[ -f "$SCRIPT_DIR/longhorn-upgrade.sh" ]]; then
+        source "$SCRIPT_DIR/longhorn-upgrade.sh"
+if [[ -f "$SCRIPT_DIR/longhorn-node-manager.sh" ]]; then
+    source "$SCRIPT_DIR/longhorn-node-manager.sh"
 fi
+    fi
 fi
 
 #################################
@@ -81,10 +84,10 @@ longhorn_overview() {
     log_info "Getting Longhorn overview..."
     echo "=== LONGHORN NODES ==="
     kubectl get nodes.longhorn.io -n longhorn-system -o custom-columns="NODE:.metadata.name,READY:.status.conditions[?(@.type=='Ready')].status,ALLOW_SCHEDULING:.spec.allowScheduling,SCHEDULABLE:.status.diskStatus.*.conditions[?(@.type=='Schedulable')].status"
-    
+
     echo -e "\n=== LONGHORN VOLUMES ==="
     kubectl get volumes.longhorn.io -n longhorn-system -o custom-columns="NAME:.metadata.name,SIZE:.spec.size,STATE:.status.state,ROBUSTNESS:.status.robustness,NODE:.status.currentNodeID"
-    
+
     echo -e "\n=== LONGHORN SETTINGS ==="
     kubectl get settings.longhorn.io -n longhorn-system -o custom-columns="NAME:.metadata.name,VALUE:.value"
 }
@@ -110,41 +113,41 @@ check_longhorn_replicas() {
 # Configure Longhorn to use only data nodes
 configure_longhorn_data_nodes_only() {
     log_info "Configuring Longhorn to use only test-k3s-data-* nodes..."
-    
+
     # Disable scheduling on non-data nodes
     for node in test-k3s-04 test-k3s-05 test-k3s-06; do
         log_info "Disabling storage scheduling on $node..."
         kubectl patch nodes.longhorn.io "$node" -n longhorn-system --type='merge' -p='{"spec":{"allowScheduling":false,"disks":{"default-disk-d7da3843ce61ab83":{"allowScheduling":false}}}}'
     done
-    
+
     # Ensure data nodes have scheduling enabled
     for node in test-k3s-data-01 test-k3s-data-02 test-k3s-data-03; do
         log_info "Enabling storage scheduling on $node..."
         kubectl patch nodes.longhorn.io "$node" -n longhorn-system --type='merge' -p='{"spec":{"allowScheduling":true,"disks":{"default-disk-d7da3843ce61ab83":{"allowScheduling":true}}}}'
     done
-    
+
     log_success "Longhorn configured to use only data nodes"
 }
 
 # Optimize Longhorn settings for better storage utilization
 optimize_longhorn_settings() {
     log_info "Optimizing Longhorn settings..."
-    
+
     # Reduce default replica count to 2
     log_info "Setting default replica count to 2..."
     kubectl patch settings.longhorn.io default-replica-count -n longhorn-system --type='merge' -p='{"value":"2"}'
-    
+
     # Reduce storage reservation to 20%
     log_info "Setting storage reservation to 20%..."
     kubectl patch settings.longhorn.io storage-reserved-percentage-for-default-disk -n longhorn-system --type='merge' -p='{"value":"20"}'
-    
+
     # Update storage reservation on data nodes (for ~72GB disks)
     local reservation=$((72 * 1024 * 1024 * 1024 / 5)) # 20% of ~72GB
     for node in test-k3s-data-01 test-k3s-data-02 test-k3s-data-03; do
         log_info "Updating storage reservation on $node..."
         kubectl patch nodes.longhorn.io "$node" -n longhorn-system --type='merge' -p="{\"spec\":{\"disks\":{\"default-disk-d7da3843ce61ab83\":{\"storageReserved\":14363430092}}}}"
     done
-    
+
     log_success "Longhorn settings optimized"
 }
 
@@ -152,12 +155,12 @@ optimize_longhorn_settings() {
 fix_volume_replica_count() {
     local volume_name="$1"
     local replica_count="${2:-2}"
-    
+
     if [[ -z "$volume_name" ]]; then
         log_error "Usage: fix_volume_replica_count <volume_name> [replica_count]"
         return 1
     fi
-    
+
     log_info "Setting replica count to $replica_count for volume $volume_name..."
     kubectl patch volumes.longhorn.io "$volume_name" -n longhorn-system --type='merge' -p="{\"spec\":{\"numberOfReplicas\":$replica_count}}"
     log_success "Volume $volume_name replica count updated to $replica_count"
@@ -170,17 +173,17 @@ fix_volume_replica_count() {
 # Check SSH key configuration
 check_ssh_config() {
     log_info "Checking SSH configuration..."
-    
+
     echo "=== SSH Keys ==="
     ls -la ~/.ssh/
-    
+
     echo -e "\n=== SSH Config ==="
     if [[ -f ~/.ssh/config ]]; then
         cat ~/.ssh/config
     else
         log_warning "No SSH config file found"
     fi
-    
+
     echo -e "\n=== SSH Agent Status ==="
     ssh-add -l 2>/dev/null || log_warning "SSH agent not running or no keys loaded"
 }
@@ -188,9 +191,9 @@ check_ssh_config() {
 # Setup SSH configuration for Kubernetes cluster
 setup_ssh_config() {
     log_info "Setting up SSH configuration..."
-    
+
     # Create SSH config
-    cat > ~/.ssh/config << 'EOF'
+    cat >~/.ssh/config <<'EOF'
 StrictHostKeyChecking no
 
 # Kubernetes cluster nodes
@@ -205,21 +208,21 @@ Host *
     IdentityFile ~/.ssh/kube
     IdentitiesOnly yes
 EOF
-    
+
     # Set proper permissions
     chmod 600 ~/.ssh/config
-    
+
     log_success "SSH configuration created"
 }
 
 # Test SSH connectivity to all cluster nodes
 test_cluster_ssh() {
     log_info "Testing SSH connectivity to all cluster nodes..."
-    
+
     local nodes=$(kubectl get nodes -o wide --no-headers | awk '{print $6}')
     local success=0
     local total=0
-    
+
     for ip in $nodes; do
         echo -n "Testing $ip: "
         if timeout 10 ssh -o BatchMode=yes ubuntu@"$ip" "hostname" 2>/dev/null; then
@@ -230,7 +233,7 @@ test_cluster_ssh() {
         fi
         ((total++))
     done
-    
+
     log_info "SSH test complete: $success/$total nodes accessible"
 }
 
@@ -238,12 +241,12 @@ test_cluster_ssh() {
 test_ssh_connection() {
     local ip="$1"
     local key_file="${2:-~/.ssh/kube}"
-    
+
     if [[ -z "$ip" ]]; then
         log_error "Usage: test_ssh_connection <ip> [key_file]"
         return 1
     fi
-    
+
     log_info "Testing SSH connection to $ip..."
     if ssh -i "$key_file" -o ConnectTimeout=5 ubuntu@"$ip" "echo 'SSH connection successful'"; then
         log_success "SSH connection to $ip successful"
@@ -261,23 +264,23 @@ test_ssh_connection() {
 check_deployment() {
     local deployment="$1"
     local namespace="${2:-default}"
-    
+
     if [[ -z "$deployment" ]]; then
         log_error "Usage: check_deployment <deployment_name> [namespace]"
         return 1
     fi
-    
+
     log_info "Checking deployment $deployment in namespace $namespace..."
-    
+
     echo "=== DEPLOYMENT STATUS ==="
     kubectl get deployment "$deployment" -n "$namespace" -o wide
-    
+
     echo -e "\n=== PODS ==="
     kubectl get pods -n "$namespace" -l app="$deployment"
-    
+
     echo -e "\n=== REPLICASETS ==="
     kubectl get rs -n "$namespace" -l app="$deployment"
-    
+
     # Get events for the deployment
     echo -e "\n=== RECENT EVENTS ==="
     kubectl get events -n "$namespace" --field-selector involvedObject.name="$deployment" --sort-by='.lastTimestamp' | tail -10
@@ -287,12 +290,12 @@ check_deployment() {
 describe_pod() {
     local pod_name="$1"
     local namespace="${2:-default}"
-    
+
     if [[ -z "$pod_name" ]]; then
         log_error "Usage: describe_pod <pod_name> [namespace]"
         return 1
     fi
-    
+
     log_info "Describing pod $pod_name in namespace $namespace..."
     kubectl describe pod "$pod_name" -n "$namespace"
 }
@@ -300,16 +303,16 @@ describe_pod() {
 # Check FluxCD status
 check_flux_status() {
     log_info "Checking FluxCD status..."
-    
+
     echo "=== FLUX SYSTEM PODS ==="
     kubectl get pods -n flux-system
-    
+
     echo -e "\n=== KUSTOMIZATIONS ==="
     kubectl get kustomizations -A
-    
+
     echo -e "\n=== GIT REPOSITORIES ==="
     kubectl get gitrepositories -A
-    
+
     echo -e "\n=== HELM RELEASES ==="
     kubectl get helmreleases -A
 }
@@ -321,7 +324,7 @@ check_flux_status() {
 # Check PVC status
 check_pvc_status() {
     local namespace="${1:-}"
-    
+
     if [[ -n "$namespace" ]]; then
         log_info "Checking PVC status in namespace $namespace..."
         kubectl get pvc -n "$namespace"
@@ -341,23 +344,23 @@ check_pv_status() {
 investigate_pvc() {
     local pvc_name="$1"
     local namespace="${2:-default}"
-    
+
     if [[ -z "$pvc_name" ]]; then
         log_error "Usage: investigate_pvc <pvc_name> [namespace]"
         return 1
     fi
-    
+
     log_info "Investigating PVC $pvc_name in namespace $namespace..."
-    
+
     echo "=== PVC DETAILS ==="
     kubectl describe pvc "$pvc_name" -n "$namespace"
-    
+
     # Get the PV name
     local pv_name=$(kubectl get pvc "$pvc_name" -n "$namespace" -o jsonpath='{.spec.volumeName}')
     if [[ -n "$pv_name" ]]; then
         echo -e "\n=== ASSOCIATED PV DETAILS ==="
         kubectl describe pv "$pv_name"
-        
+
         # If it's a Longhorn volume, get Longhorn details
         if kubectl get pv "$pv_name" -o jsonpath='{.spec.csi.driver}' | grep -q longhorn; then
             echo -e "\n=== LONGHORN VOLUME DETAILS ==="
@@ -375,15 +378,15 @@ get_pod_logs() {
     local pod_name="$1"
     local namespace="${2:-default}"
     local lines="${3:-100}"
-    
+
     if [[ -z "$pod_name" ]]; then
         log_error "Usage: get_pod_logs <pod_name> [namespace] [lines]"
         return 1
     fi
-    
+
     log_info "Getting logs from pod $pod_name in namespace $namespace (last $lines lines)..."
     kubectl logs "$pod_name" -n "$namespace" --tail="$lines"
-    
+
     # Also get previous logs if available
     echo -e "\n=== PREVIOUS LOGS (if available) ==="
     kubectl logs "$pod_name" -n "$namespace" --previous --tail="$lines" 2>/dev/null || log_warning "No previous logs available"
@@ -393,12 +396,12 @@ get_pod_logs() {
 monitor_pod() {
     local pod_name="$1"
     local namespace="${2:-default}"
-    
+
     if [[ -z "$pod_name" ]]; then
         log_error "Usage: monitor_pod <pod_name> [namespace]"
         return 1
     fi
-    
+
     log_info "Monitoring pod $pod_name in namespace $namespace (Ctrl+C to stop)..."
     watch -n 2 "kubectl get pod $pod_name -n $namespace -o wide; echo; kubectl describe pod $pod_name -n $namespace | tail -10"
 }
@@ -407,7 +410,7 @@ monitor_pod() {
 get_cluster_events() {
     local namespace="${1:-}"
     local lines="${2:-50}"
-    
+
     if [[ -n "$namespace" ]]; then
         log_info "Getting recent events in namespace $namespace..."
         kubectl get events -n "$namespace" --sort-by='.lastTimestamp' | tail -"$lines"
@@ -424,14 +427,14 @@ get_cluster_events() {
 # Clean up failed pods
 cleanup_failed_pods() {
     local namespace="${1:-}"
-    
+
     log_warning "This will delete all failed/evicted pods. Continue? (y/N)"
     read -r response
     if [[ "$response" != "y" && "$response" != "Y" ]]; then
         log_info "Cleanup cancelled"
         return 0
     fi
-    
+
     if [[ -n "$namespace" ]]; then
         log_info "Cleaning up failed pods in namespace $namespace..."
         kubectl delete pods -n "$namespace" --field-selector=status.phase=Failed
@@ -446,14 +449,14 @@ cleanup_failed_pods() {
 # Clean up completed jobs
 cleanup_completed_jobs() {
     local namespace="${1:-}"
-    
+
     log_warning "This will delete all completed jobs. Continue? (y/N)"
     read -r response
     if [[ "$response" != "y" && "$response" != "Y" ]]; then
         log_info "Cleanup cancelled"
         return 0
     fi
-    
+
     if [[ -n "$namespace" ]]; then
         log_info "Cleaning up completed jobs in namespace $namespace..."
         kubectl delete jobs -n "$namespace" --field-selector=status.successful=1
@@ -470,47 +473,47 @@ cleanup_completed_jobs() {
 # Full cluster health check
 full_health_check() {
     log_info "Starting comprehensive cluster health check..."
-    
+
     echo "========================================="
     echo "           CLUSTER OVERVIEW"
     echo "========================================="
     cluster_overview
-    
+
     echo -e "\n========================================="
     echo "           NODE HEALTH"
     echo "========================================="
     check_node_health
-    
+
     echo -e "\n========================================="
     echo "           FAILING RESOURCES"
     echo "========================================="
     check_failing_pods
-    
+
     echo -e "\n========================================="
     echo "           LONGHORN STATUS"
     echo "========================================="
     longhorn_overview
-    
+
     echo -e "\n========================================="
     echo "           STORAGE STATUS"
     echo "========================================="
     longhorn_storage_status
-    
+
     echo -e "\n========================================="
     echo "           PVC STATUS"
     echo "========================================="
     check_pvc_status
-    
+
     echo -e "\n========================================="
     echo "           RECENT EVENTS"
     echo "========================================="
     get_cluster_events "" 20
-    
+
     echo -e "\n========================================="
     echo "           SSH CONNECTIVITY"
     echo "========================================="
     test_cluster_ssh
-    
+
     log_success "Health check completed"
 }
 
@@ -519,8 +522,8 @@ full_health_check() {
 #################################
 
 show_usage() {
-    cat << 'EOF'
-Kubernetes and Longhorn Troubleshooting Scripts
+    cat <<'EOF'
+Kubernetes and Longhorn Toolkit
 
 CLUSTER INSPECTION:
   cluster_overview              - Get overall cluster status
@@ -535,6 +538,12 @@ LONGHORN FUNCTIONS:
   upgrade_longhorn <version>     - Upgrade Longhorn to specific version
   fix_version_conflicts         - Auto-fix Longhorn version conflicts
   backup_longhorn_config [dir]   - Backup Longhorn configuration
+  show_longhorn_nodes_status     - Comprehensive node status overview
+  enable_node_scheduling <nodes>  - Enable scheduling on specific nodes
+  disable_node_scheduling <nodes> - Disable scheduling on specific nodes
+  drain_longhorn_node <node>     - Drain node for maintenance
+  uncordon_longhorn_node <node>  - Re-enable node after maintenance
+  show_problem_nodes             - Identify nodes needing attention
   longhorn_overview           - Get Longhorn system overview
   longhorn_storage_status     - Check storage availability
   check_longhorn_replicas [volume] - Check replica status
