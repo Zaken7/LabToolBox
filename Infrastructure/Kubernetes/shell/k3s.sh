@@ -221,8 +221,8 @@ kubectl apply -f $HOME/ipAddressPool.yaml
 cat $HOME/ipAddressPool.yaml
 #
 # Step 9: Test with Nginx
-kubectl apply -f https://raw.githubusercontent.com/inlets/inlets-operator/master/contrib/nginx-sample-deployment.yaml -n default
-kubectl expose deployment nginx-1 --port=8180 --type=LoadBalancer -n default
+#kubectl apply -f https://raw.githubusercontent.com/inlets/inlets-operator/master/contrib/nginx-sample-deployment.yaml -n default
+#kubectl expose deployment nginx-1 --port=8180 --type=LoadBalancer -n default
 
 #echo -e " \033[32;5mWaiting for K3S to sync and LoadBalancer to come online\033[0m"
 #
